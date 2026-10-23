@@ -1,0 +1,31 @@
+Run started:2026-10-23 07:44:42.191004+00:00
+
+Test results:
+>> Issue: [B105:hardcoded_password_string] Possible hardcoded password: 'django-insecure-y7l(cti5k-!+u+!wo1236^h5+2a1v2g#s596t&ya!yhfct2e!e'
+   Severity: Low   Confidence: Medium
+   CWE: CWE-259 (https://cwe.mitre.org/data/definitions/259.html)
+   More Info: https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html
+   Location: ./mediplus/settings.py:24:13
+23	# SECURITY WARNING: keep the secret key used in production secret!
+24	SECRET_KEY = 'django-insecure-y7l(cti5k-!+u+!wo1236^h5+2a1v2g#s596t&ya!yhfct2e!e'
+25	
+
+--------------------------------------------------
+
+Code scanned:
+	Total lines of code: 431
+	Total lines skipped (#nosec): 0
+	Total potential issues skipped due to specifically being disabled (e.g., #nosec BXXX): 0
+
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 1
+		Medium: 0
+		High: 0
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 1
+		High: 0
+Files skipped (0):
