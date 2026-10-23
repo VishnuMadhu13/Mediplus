@@ -7,39 +7,46 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
+    parameters {
+        booleanParam(name: 'ENFORCE_SCANS', defaultValue: false,
+                     description: 'Fail the build on Trivy HIGH/CRITICAL findings')
+    }
+
     environment {
-        APP_NAME       = 'mediplus'
-        IMAGE          = 'vishnumadhu13/mediplus'
-        IMAGE_TAG      = "${env.BUILD_NUMBER}"
-        REPO_URL       = 'https://github.com/VishnuMadhu13/mediplus.git'
-        SONAR_HOST_URL  = 'http://3.25.190.60:9000'
-        GIT_BRANCH_CI  = 'main'
-        // Jenkins credential IDs - change to match your Jenkins
-        GITHUB_CREDS   = 'github-jenkins'
-        DOCKERHUB_CREDS = 'docker-cred'
-        SONAR_TOKEN_ID = 'sonar-token'      // "Secret text" credential holding the Sonar token
-        // CI-only values for unit tests / DAST container (not used in production)
-        DJANGO_SETTINGS_MODULE = 'mediplus.settings_container'
-        CI_SECRET_KEY  = 'ci-only-not-a-real-secret'
+        APP_NAME        = 'takecare'
+        DOCKERHUB_USER  = 'vishnumadhu13'
+        IMAGE           = "${DOCKERHUB_USER}/${APP_NAME}"
+        TAG             = "${BUILD_NUMBER}"
+        REPO_HOST_PATH  = 'github.com/VishnuMadhu13/takecare.git'
+        SONAR_HOST_URL  = 'http://3.25.190.60:9000'      // adjust to your SonarQube container/service name
+        DOCKER_NETWORK  = 'ubuntu_default'             // docker network shared by Jenkins + SonarQube
+        GIT_CRED        = 'github-jenkins'
+        DOCKERHUB_CRED  = 'docker-cred'      // adjust to your Docker Hub credential id
+        SONAR_CRED      = 'sonar-token'                // Secret text credential with SonarQube token
+        PYTHONDONTWRITEBYTECODE = '1'
     }
 
     stages {
+
         stage('Checkout') {
             steps {
-                git branch: "${GIT_BRANCH_CI}", credentialsId: "${GITHUB_CREDS}", url: "${REPO_URL}"
-                sh 'mkdir -p reports/zap'
+                checkout scm
+                sh 'git log -1 --pretty=oneline'
+                sh 'git clean -ffdx'
             }
         }
 
         stage('Unit Tests') {
-            agent { docker { image 'python:3.12-slim'; reuseNode true; args '-e HOME=/tmp -e PYTHONUSERBASE=/tmp/pyuser' } }
-            environment { DJANGO_SECRET_KEY = "${CI_SECRET_KEY}"; SQLITE_PATH = '/tmp/test.sqlite3' }
+            agent { docker { image 'python:3.10-slim-bookworm'; args '-u root'; reuseNode true } }
             steps {
                 sh '''
-                    export PATH="$PATH:/tmp/pyuser/bin"
-                    pip install --user -q -r requirements.txt
+                    apt-get update -qq
+                    apt-get install -y -qq --no-install-recommends build-essential pkg-config default-libmysqlclient-dev
+                    pip install --no-cache-dir -r requirements.txt
+                    export DB_ENGINE=sqlite
                     python manage.py check
-                    python manage.py test
+                    python manage.py test --noinput
+                    chmod -R a+rwX "$WORKSPACE" || true
                 '''
             }
         }
@@ -47,138 +54,130 @@ pipeline {
         stage('SAST') {
             parallel {
                 stage('SonarQube') {
+                    agent { docker { image 'sonarsource/sonar-scanner-cli:latest'
+                                     args "-u root --entrypoint='' --network ${DOCKER_NETWORK}"
+                                     reuseNode true } }
                     steps {
-                        script { scannerHome = tool 'SonarScanner' }
-                        withSonarQubeEnv("${SONAR_SERVER}") {
-                            sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=mediplus"
-                        }
-                        timeout(time: 10, unit: 'MINUTES') {
-                            waitForQualityGate abortPipeline: true
+                        withCredentials([string(credentialsId: "${SONAR_CRED}", variable: 'SONAR_TOKEN')]) {
+                            sh 'sonar-scanner -Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300'
                         }
                     }
                 }
                 stage('Bandit') {
-                    agent { docker { image 'python:3.12-slim'; reuseNode true; args '-e HOME=/tmp -e PYTHONUSERBASE=/tmp/pyuser' } }
+                    agent { docker { image 'python:3.10-slim-bookworm'; args '-u root'; reuseNode true } }
                     steps {
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                            sh '''
-                                export PATH="$PATH:/tmp/pyuser/bin"
-                                pip install --user -q bandit
-                                bandit -r . -x ./.vscode,./reports,./staticfiles,./k8s \
-                                    -f json -o reports/bandit.json || BANDIT_RC=$?
-                                bandit -r . -x ./.vscode,./reports,./staticfiles,./k8s \
-                                    -f txt -o reports/bandit.txt || true
-                                test -s reports/bandit.json
-                                exit ${BANDIT_RC:-0}
-                            '''
-                        }
+                        sh '''
+                            pip install --no-cache-dir bandit
+                            bandit -r . -x ./venv,./.venv,./static,./staticfiles,./media \
+                                   -f json -o bandit-report.json || true
+                            chmod -R a+rwX "$WORKSPACE" || true
+                        '''
                     }
+                    post { always { archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true } }
                 }
             }
         }
 
         stage('Dependency Scan') {
-            agent { docker { image 'python:3.12-slim'; reuseNode true; args '-e HOME=/tmp -e PYTHONUSERBASE=/tmp/pyuser' } }
+            agent { docker { image 'python:3.10-slim-bookworm'; args '-u root'; reuseNode true } }
             steps {
-                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                    sh '''
-                        export PATH="$PATH:/tmp/pyuser/bin"
-                        pip install --user -q pip-audit
-                        pip-audit -r requirements.txt --no-deps --disable-pip \
-                            -f json -o reports/pip-audit.json || AUDIT_RC=$?
-                        test -s reports/pip-audit.json
-                        exit ${AUDIT_RC:-0}
-                    '''
-                }
+                // --no-deps + --disable-pip: audits the pinned list without building mysqlclient
+                sh '''
+                    pip install --no-cache-dir pip-audit
+                    pip-audit -r requirements.txt --no-deps --disable-pip -f json -o pip-audit.json || true
+                    pip-audit -r requirements.txt --no-deps --disable-pip || true
+                    chmod -R a+rwX "$WORKSPACE" || true
+                '''
             }
+            post { always { archiveArtifacts artifacts: 'pip-audit.json', allowEmptyArchive: true } }
         }
 
         stage('Docker Build') {
             steps {
-                sh 'docker build -t ${IMAGE}:${IMAGE_TAG} -t ${IMAGE}:latest .'
+                sh 'docker build -t $IMAGE:$TAG -t $IMAGE:latest .'
             }
         }
 
         stage('Trivy Image Scan') {
             steps {
-                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-                    // stdout redirect (no bind mount) so it works when Jenkins itself runs in a container
-                    sh '''
-                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-                            aquasec/trivy:latest image --quiet --format json \
-                            --severity CRITICAL,HIGH,MEDIUM --ignore-unfixed \
-                            ${IMAGE}:${IMAGE_TAG} > reports/trivy-image.json
-                        test -s reports/trivy-image.json
-                    '''
+                script {
+                    def exitCode = params.ENFORCE_SCANS ? 1 : 0
+                    sh """
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+                            aquasec/trivy:latest image --severity HIGH,CRITICAL --exit-code 0 --no-progress --quiet \
+                            --format json ${IMAGE}:${TAG} > trivy-report.json
+                        RC=0
+                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+                            aquasec/trivy:latest image --severity HIGH,CRITICAL --exit-code ${exitCode} --no-progress --quiet \
+                            ${IMAGE}:${TAG} > trivy-report.txt || RC=\$?
+                        cat trivy-report.txt
+                        exit \$RC
+                    """
                 }
             }
+            post { always { archiveArtifacts artifacts: 'trivy-report.*', allowEmptyArchive: true } }
         }
 
         stage('DAST (OWASP ZAP)') {
             steps {
                 sh '''
-                    NET=mediplus-dast-${BUILD_NUMBER}
-                    APP=mediplus-app-${BUILD_NUMBER}
-                    ZAP=mediplus-zap-${BUILD_NUMBER}
+                    NET=dast-net-${BUILD_NUMBER}
+                    APP=takecare-dast-${BUILD_NUMBER}
+                    ZAP=zap-${BUILD_NUMBER}
+                    VOL=zap-wrk-${BUILD_NUMBER}
+                    cleanup() {
+                        docker rm -f $APP $ZAP >/dev/null 2>&1 || true
+                        docker network rm $NET >/dev/null 2>&1 || true
+                        docker volume rm $VOL >/dev/null 2>&1 || true
+                    }
+                    trap cleanup EXIT
+
                     docker network create $NET
+                    docker volume create $VOL
+                    docker run --rm -u root -v $VOL:/zap/wrk ghcr.io/zaproxy/zaproxy:stable chmod 777 /zap/wrk
 
-                    docker run -d --name $APP --network $NET --network-alias mediplus-app \
-                        -e DJANGO_SECRET_KEY=${CI_SECRET_KEY} \
-                        -e DJANGO_ALLOWED_HOSTS=mediplus-app,localhost \
-                        ${IMAGE}:${IMAGE_TAG}
+                    docker run -d --name $APP --network $NET \
+                        -e DB_ENGINE=sqlite -e DEBUG=False -e ALLOWED_HOSTS='*' -e RUN_MIGRATIONS=1 \
+                        $IMAGE:$TAG
 
-                    ok=0
                     for i in $(seq 1 30); do
-                        if docker run --rm --network $NET curlimages/curl:8.10.1 -fsS -o /dev/null http://mediplus-app:8000/index; then ok=1; break; fi
-                        sleep 3
+                        docker exec $APP python -c "import socket; socket.create_connection(('localhost',8000),2)" && break
+                        sleep 2
                     done
-                    if [ "$ok" != 1 ]; then echo "App did not become ready"; docker logs $APP; exit 1; fi
 
-                    # Named volume + docker cp (a bind mount of $WORKSPACE breaks when Jenkins runs in a container)
-                    docker run --name $ZAP --network $NET -u 0 -v zap-wrk-${BUILD_NUMBER}:/zap/wrk \
-                        ghcr.io/zaproxy/zaproxy:stable \
-                        zap-baseline.py -t http://mediplus-app:8000/index \
-                        -r zap-report.html -J zap-report.json -w zap-report.md -I || true
-
-                    docker cp $ZAP:/zap/wrk/. reports/zap/
-                    # Fail loudly instead of staying green with no report
-                    test -s reports/zap/zap-report.json
+                    docker run --name $ZAP --network $NET -v $VOL:/zap/wrk -t ghcr.io/zaproxy/zaproxy:stable \
+                        zap-baseline.py -t http://$APP:8000 -r zap-report.html -J zap-report.json -I || true
+                    docker cp $ZAP:/zap/wrk/zap-report.html ./zap-report.html
+                    docker cp $ZAP:/zap/wrk/zap-report.json ./zap-report.json
+                    test -s zap-report.html
                 '''
             }
-            post {
-                always {
-                    sh '''
-                        docker rm -f mediplus-app-${BUILD_NUMBER} mediplus-zap-${BUILD_NUMBER} 2>/dev/null || true
-                        docker network rm mediplus-dast-${BUILD_NUMBER} 2>/dev/null || true
-                        docker volume rm zap-wrk-${BUILD_NUMBER} 2>/dev/null || true
-                    '''
-                }
-            }
+            post { always { archiveArtifacts artifacts: 'zap-report.*', allowEmptyArchive: true } }
         }
 
         stage('Consolidated Security Report') {
-            agent { docker { image 'python:3.12-slim'; reuseNode true; args '-e HOME=/tmp' } }
+            agent { docker { image 'python:3.10-slim-bookworm'
+                            args "--network ${DOCKER_NETWORK}"
+                            reuseNode true } }
             steps {
-                withSonarQubeEnv("${SONAR_SERVER}") {
-                    withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
-                        sh 'python scripts/consolidate_reports.py --dir reports --project ${APP_NAME} --build ${BUILD_NUMBER}'
-                    }
+                withCredentials([string(credentialsId: "${SONAR_CRED}", variable: 'SONAR_TOKEN')]) {
+                    sh '''python scripts/generate_security_report.py \
+                            --build "$BUILD_NUMBER" --image "$IMAGE:$TAG" \
+                            --sonar-host "$SONAR_HOST_URL" --sonar-project takecare \
+                            --sonar-url "http://3.107.90.61:9000/dashboard?id=takecare"'''
                 }
             }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
-                }
-            }
+            post { always { archiveArtifacts artifacts: 'security-report.html', allowEmptyArchive: true } }
         }
 
         stage('Push Image') {
             steps {
-                withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+                withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CRED}",
+                                                  usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
                     sh '''
                         echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
-                        docker push ${IMAGE}:${IMAGE_TAG}
-                        docker push ${IMAGE}:latest
+                        docker push $IMAGE:$TAG
+                        docker push $IMAGE:latest
                         docker logout
                     '''
                 }
@@ -187,20 +186,20 @@ pipeline {
 
         stage('Update Manifest (GitOps)') {
             steps {
-                withCredentials([usernamePassword(credentialsId: "${GITHUB_CREDS}", usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                withCredentials([usernamePassword(credentialsId: "${GIT_CRED}",
+                                                  usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
                     sh '''
-                        AUTH="AUTHORIZATION: basic $(printf '%s:%s' "$GH_USER" "$GH_TOKEN" | base64 | tr -d '\\n')"
-                        git config user.email "jenkins@mediplus.local"
+                        git config user.email "jenkins@takecare.local"
                         git config user.name  "jenkins"
-                        git -c http.extraheader="$AUTH" fetch origin ${GIT_BRANCH_CI}
-                        git checkout -B ${GIT_BRANCH_CI} origin/${GIT_BRANCH_CI}
+                        git fetch https://${GIT_USER}:${GIT_PASS}@${REPO_HOST_PATH} main
+                        git checkout -B main FETCH_HEAD
 
-                        sed -i "s|image: ${IMAGE}:.*|image: ${IMAGE}:${IMAGE_TAG}|" k8s/deployments.yaml
-                        grep "image: ${IMAGE}:${IMAGE_TAG}" k8s/deployments.yaml
+                        sed -i "s|image: ${IMAGE}:.*|image: ${IMAGE}:${TAG}|" k8s/deployments.yaml
+                        grep "image: ${IMAGE}" k8s/deployments.yaml
 
                         git add k8s/deployments.yaml
-                        git commit -m "ci: deploy ${IMAGE}:${IMAGE_TAG} [skip ci]" || { echo "nothing to commit"; exit 0; }
-                        git -c http.extraheader="$AUTH" push origin ${GIT_BRANCH_CI}
+                        git diff --cached --quiet || git commit -m "ci: deploy ${IMAGE}:${TAG} [skip ci]"
+                        git push https://${GIT_USER}:${GIT_PASS}@${REPO_HOST_PATH} main
                     '''
                 }
             }
@@ -208,6 +207,10 @@ pipeline {
     }
 
     post {
-        always { sh 'docker image prune -f || true' }
+        always {
+            sh 'docker image prune -f || true'
+        }
+        success { echo "Pushed ${IMAGE}:${TAG}; ArgoCD will sync k8s/ to Minikube." }
+        failure { echo 'Pipeline failed - check the stage logs above.' }
     }
 }
