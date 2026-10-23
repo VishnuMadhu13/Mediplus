@@ -1,12 +1,19 @@
-from django.shortcuts import render,redirect
+from django.shortcuts import render,redirect,get_object_or_404
 from mediplus.models import user_details
 from mediplus.models import doctor_details
 from user_app.models import appointment_details
+from django.views.decorators.http import require_POST
 # Create your views here.
 
 def userview(request):
     data=user_details.objects.all()
     return render(request,'userview.html',{'userdata':data})
+
+@require_POST
+def userdelete(request, id):
+    data = get_object_or_404(user_details, pk=id)
+    data.delete()
+    return redirect('userview')
 
 
 
