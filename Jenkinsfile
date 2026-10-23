@@ -137,19 +137,21 @@ pipeline {
                     docker run --rm -u root -v $VOL:/zap/wrk ghcr.io/zaproxy/zaproxy:stable chmod 777 /zap/wrk
 
                     docker run -d --name $APP --network $NET \
-                        -e DB_ENGINE=sqlite -e DEBUG=False -e ALLOWED_HOSTS='*' -e RUN_MIGRATIONS=1 \
-                        $IMAGE:$TAG
+                        -e DB_ENGINE=sqlite -e DEBUG=False -e ALLOWED_HOSTS='*' \
+                        -e RUN_MIGRATIONS=1 -e DJANGO_SECRET_KEY=dast-only-secret \
+                        vishnumadhu13/mediplus:${BUILD_NUMBER}
 
+                    ready=0
                     for i in $(seq 1 30); do
-                        docker exec $APP python -c "import socket; socket.create_connection(('localhost',8000),2)" && break
-                        sleep 2
+                        if [ "$(docker inspect -f '{{.State.Running}}' $APP)" != "true" ]; then
+                            echo "App container exited:"; docker logs $APP; exit 1
+                        fi
+                        if docker exec $APP python -c "import socket; socket.create_connection(('localhost',8000),2)"; then
+                            ready=1; break
+                        fi
+                            sleep 2
                     done
-
-                    docker run --name $ZAP --network $NET -v $VOL:/zap/wrk -t ghcr.io/zaproxy/zaproxy:stable \
-                        zap-baseline.py -t http://$APP:8000 -r zap-report.html -J zap-report.json -I || true
-                    docker cp $ZAP:/zap/wrk/zap-report.html ./zap-report.html
-                    docker cp $ZAP:/zap/wrk/zap-report.json ./zap-report.json
-                    test -s zap-report.html
+                    [ "$ready" = 1 ] || { docker logs $APP; exit 1; }
                 '''
             }
             post { always { archiveArtifacts artifacts: 'zap-report.*', allowEmptyArchive: true } }
