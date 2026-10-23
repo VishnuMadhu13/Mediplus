@@ -122,7 +122,7 @@ pipeline {
             steps {
                 sh '''
                     NET=dast-net-${BUILD_NUMBER}
-                    APP=takecare-dast-${BUILD_NUMBER}
+                    APP=mediplus-dast-${BUILD_NUMBER}
                     ZAP=zap-${BUILD_NUMBER}
                     VOL=zap-wrk-${BUILD_NUMBER}
                     cleanup() {
