@@ -37,7 +37,7 @@ pipeline {
         }
 
         stage('Unit Tests') {
-            agent { docker { image 'python:3.10-slim-bookworm'; args '-u root'; reuseNode true } }
+            agent { docker { image 'python:3.12-slim-bookworm'; args '-u root'; reuseNode true } }
             steps {
                 sh '''
                     apt-get update -qq
